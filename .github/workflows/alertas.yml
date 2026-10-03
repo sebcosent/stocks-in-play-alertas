@@ -1,0 +1,57 @@
+yaml
+name: Alertas Stocks in Play
+
+on:
+  schedule:
+    # Cada 10 minutos, de lunes a viernes, de 06:00 a 23:59 UTC
+    # (08:00-01:59 hora de España en verano; 07:00-00:59 en invierno)
+    - cron: "*/10 6-23 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      prueba:
+        description: "Mandar un mensaje de prueba a Telegram"
+        type: boolean
+        default: true
+
+concurrency:
+  group: alertas
+  cancel-in-progress: false
+
+jobs:
+  alertas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements_nube.txt
+
+      - name: Instalar librerías
+        run: pip install -q -r requirements_nube.txt
+
+      - name: Recuperar estado anterior
+        uses: actions/cache/restore@v4
+        with:
+          path: estado
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: Revisar el mercado y mandar alertas
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+          PRUEBA: ${{ github.event.inputs.prueba }}
+          TZ: Europe/Madrid
+        run: python nube.py
+
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: estado
+          key: estado-${{ github.run_id }}
