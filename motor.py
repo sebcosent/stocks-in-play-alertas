@@ -22,7 +22,7 @@ DEFAULTS = {
     "only_bingx": True, "bingx_extra": "",
     "watchlist": "", "min_price": 2.0, "min_avg_vol": 300_000, "min_move": 2.0, "top_n": 20,
     "refresh": 120, "alerts_on": True, "alert_score": 40, "alert_rvol": 3.0,
-    "alert_gap": 8.0, "sound": True,
+    "alert_gap": 8.0, "sound": True, "app_popups": False,
     "fx_alerts": True, "fx_prev": True, "fx_asia": True, "fx_atr": 1.0, "fx_macro": True,
     "fx_watch": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
                  "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "GC=F"],
