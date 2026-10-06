@@ -148,7 +148,8 @@ def scan_stocks(p: dict):
         universe = list(dict.fromkeys(watch + info + core.BASE_UNIVERSE))[:320]
     universe = [t for t in universe if t and "." not in t and "^" not in t]
 
-    daily = get_daily(universe + ["SPY"])
+    universe = list(dict.fromkeys(universe))
+    daily = get_daily(list(dict.fromkeys(universe + ["SPY"])))
     keep = []
     for t in universe:
         d = daily.get(t)
@@ -156,7 +157,7 @@ def scan_stocks(p: dict):
                           and d["Close"].iloc[-1] >= p["min_price"] * 0.7
                           and d["Volume"].tail(63).mean() >= p["min_avg_vol"] * 0.7):
             keep.append(t)
-    intra = get_intraday(keep + ["SPY"])
+    intra = get_intraday(list(dict.fromkeys(keep + ["SPY"])))
     spy = core.compute_metrics("SPY", daily.get("SPY"), core._split(intra, "SPY"), 1.0)
     spy_chg = spy["Cambio %"] if spy else float("nan")
 
@@ -221,16 +222,26 @@ def one_pass() -> int:
         return 0
     sent = core.load_sent()
     msgs: list[str] = []
+    # Cada parte va por separado: si una falla, las demás siguen avisando
     if stock_hours():
-        df, news, spy = scan_stocks(p)
-        msgs += motor.stock_messages(df, news, p, sent)
         try:
-            core.record_picks(df, core.market_status(), spy)
+            df, news, spy = scan_stocks(p)
+            msgs += motor.stock_messages(df, news, p, sent)
+            try:
+                core.record_picks(df, core.market_status(), spy)
+            except Exception:
+                pass
         except Exception:
-            pass
+            log("Error en acciones: " + traceback.format_exc(limit=3).replace("\n", " | "))
     if p["fx_alerts"] and p["fx_watch"]:
-        msgs += motor.fx_messages(scan_fx(), p, sent)
-        msgs += motor.macro_messages(get_econ(), p, sent)
+        try:
+            msgs += motor.fx_messages(scan_fx(), p, sent)
+        except Exception:
+            log("Error en divisas: " + traceback.format_exc(limit=3).replace("\n", " | "))
+        try:
+            msgs += motor.macro_messages(get_econ(), p, sent)
+        except Exception:
+            log("Error en calendario: " + traceback.format_exc(limit=3).replace("\n", " | "))
     if msgs:
         core.save_sent(sent)
         core.log_alerts(msgs)
@@ -238,11 +249,16 @@ def one_pass() -> int:
         # repite; solo quedan en el historial de la app.
         cloud_sends = core.load_config().get("cloud_telegram") and not os.environ.get(
             "STOCKS_CLOUD")
-        if p["tg_token"] and p["tg_chat"] and not cloud_sends:
-            for i in range(0, len(msgs), 20):
-                core.send_telegram(p["tg_token"], p["tg_chat"],
-                                   "Stocks in Play\n\n" + "\n".join(msgs[i:i + 20]))
-        log(f"{len(msgs)} alertas enviadas")
+        if not (p["tg_token"] and p["tg_chat"]):
+            log(f"{len(msgs)} alertas (Telegram no configurado)")
+        elif cloud_sends:
+            log(f"{len(msgs)} alertas (Telegram lo manda la nube, no este ordenador)")
+        else:
+            ok = all(core.send_telegram(p["tg_token"], p["tg_chat"],
+                                        "Stocks in Play\n\n" + "\n".join(msgs[i:i + 20]))
+                     for i in range(0, len(msgs), 20))
+            log(f"{len(msgs)} alertas enviadas a Telegram" if ok else
+                f"{len(msgs)} alertas: ERROR al enviar a Telegram (revisa token y Chat ID)")
     write_status(estado="Funcionando", ultima_revision=datetime.now(motor.MADRID)
                  .strftime("%d/%m %H:%M"), ultimas_alertas=len(msgs))
     return int(p["refresh"]) or 120

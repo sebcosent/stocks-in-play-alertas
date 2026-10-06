@@ -178,11 +178,17 @@ def _split(data: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
         lv0 = data.columns.get_level_values(0)
         lv1 = data.columns.get_level_values(1)
         if ticker in lv0:
-            return data[ticker]
-        if ticker in lv1:
-            return data.xs(ticker, axis=1, level=1)
-        return None
-    return data
+            out = data[ticker]
+        elif ticker in lv1:
+            out = data.xs(ticker, axis=1, level=1)
+        else:
+            return None
+    else:
+        out = data
+    # Si un ticker vino repetido en la descarga, quedarse con una sola columna de cada
+    if isinstance(out, pd.DataFrame) and out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated()]
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -478,29 +484,157 @@ def yahoo_market_news(tickers=("^GSPC", "^IXIC", "EURUSD=X", "GC=F", "CL=F")) ->
 
 
 ECON_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+TV_ECON_URL = "https://economic-calendar.tradingview.com/events"
 IMPACT_ES = {"High": "Alto", "Medium": "Medio", "Low": "Bajo", "Holiday": "Festivo"}
+TV_IMPACT = {1: "Alto", 0: "Medio", -1: "Bajo"}
+COUNTRY_CCY = {"US": "USD", "EU": "EUR", "DE": "EUR", "FR": "EUR", "IT": "EUR", "ES": "EUR",
+               "GB": "GBP", "UK": "GBP", "JP": "JPY", "AU": "AUD", "CA": "CAD", "CH": "CHF",
+               "NZ": "NZD", "CN": "CNY"}
+ECON_COLS = ["Hora", "Divisa", "Impacto", "Evento", "Actual", "Previsión", "Anterior",
+             "Actual_num", "Previsión_num"]
 
 
-def economic_calendar() -> pd.DataFrame:
-    """Calendario económico de la semana (datos públicos de Forex Factory)."""
+def _ff_calendar() -> pd.DataFrame:
+    """Forex Factory: buena clasificación de impacto, pero sin el dato real."""
     try:
-        r = requests.get(ECON_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(ECON_URL, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         df = pd.DataFrame(r.json())
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=ECON_COLS)
     if df.empty:
-        return df
+        return pd.DataFrame(columns=ECON_COLS)
     df["Hora"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = df.rename(columns={"title": "Evento", "country": "Divisa", "forecast": "Previsión",
                             "previous": "Anterior"})
     df["Impacto"] = df["impact"].map(lambda x: IMPACT_ES.get(x, x))
-    if "actual" in df:
-        df = df.rename(columns={"actual": "Actual"})
-    else:
-        df["Actual"] = ""
-    return df[["Hora", "Divisa", "Impacto", "Evento", "Actual", "Previsión", "Anterior"]] \
-        .dropna(subset=["Hora"]).sort_values("Hora").reset_index(drop=True)
+    df["Actual"] = df.get("actual", "")
+    df["Actual_num"] = float("nan")
+    df["Previsión_num"] = float("nan")
+    return df.reindex(columns=ECON_COLS).dropna(subset=["Hora"])
+
+
+def _fmt_val(v, unit: str, scale: str) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    try:
+        v = float(v)
+        s = f"{v:,.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{s}{scale or ''}{unit or ''}"
+
+
+def _tv_calendar() -> pd.DataFrame:
+    """Calendario de TradingView: incluye el dato real cuando se publica."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=now.weekday() + 1)).replace(hour=0, minute=0, second=0,
+                                                                microsecond=0)
+    end = start + timedelta(days=8)
+    try:
+        r = requests.get(TV_ECON_URL, timeout=10, params={
+            "from": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "to": end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "countries": ",".join(sorted(COUNTRY_CCY))},
+            headers={"Origin": "https://www.tradingview.com",
+                     "Referer": "https://www.tradingview.com/",
+                     "User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
+        rows = data.get("result", data) if isinstance(data, dict) else data
+    except Exception:
+        return pd.DataFrame(columns=ECON_COLS)
+    out = []
+    for e in rows or []:
+        unit, scale = e.get("unit") or "", e.get("scale") or ""
+        out.append({
+            "Hora": pd.to_datetime(e.get("date"), utc=True, errors="coerce"),
+            "Divisa": e.get("currency") or COUNTRY_CCY.get(e.get("country", ""), ""),
+            "Impacto": TV_IMPACT.get(e.get("importance"), "Bajo"),
+            "Evento": e.get("title") or e.get("indicator") or "",
+            "Actual": _fmt_val(e.get("actual"), unit, scale),
+            "Previsión": _fmt_val(e.get("forecast"), unit, scale),
+            "Anterior": _fmt_val(e.get("previous"), unit, scale),
+            "Actual_num": _num(e.get("actual")),
+            "Previsión_num": _num(e.get("forecast")),
+        })
+    return pd.DataFrame(out, columns=ECON_COLS).dropna(subset=["Hora"])
+
+
+def _merge_calendars(ff: pd.DataFrame, tv: pd.DataFrame) -> pd.DataFrame:
+    """Usa la lista de Forex Factory y le añade el dato real de TradingView
+    (mismo minuto y divisa, y el título más parecido)."""
+    if ff.empty:
+        return tv
+    if tv.empty:
+        return ff
+    ff = ff.copy()
+    tv = tv.copy()
+    tv["_k"] = tv["Divisa"] + tv["Hora"].dt.strftime("%Y%m%d%H%M")
+    groups = {k: g for k, g in tv.groupby("_k")}
+
+    def words(s):
+        return set(re.findall(r"[a-z]{3,}", str(s).lower()))
+
+    for i, r in ff.iterrows():
+        g = groups.get(r["Divisa"] + r["Hora"].strftime("%Y%m%d%H%M"))
+        if g is None:
+            continue
+        w = words(r["Evento"])
+        best = max(g.to_dict("records"), key=lambda x: len(w & words(x["Evento"])))
+        if not w & words(best["Evento"]) and len(g) > 1:
+            continue
+        for col in ("Actual", "Actual_num", "Previsión_num"):
+            ff.at[i, col] = best[col]
+        if not r["Previsión"]:
+            ff.at[i, "Previsión"] = best["Previsión"]
+    return ff
+
+
+# Indicadores en los que un dato MÁS ALTO es MALO para la divisa
+_INVERSE = ("unemployment", "jobless", "claims", "claimant", "job cuts", "layoffs",
+            "bankruptc", "deficit")
+# Indicadores sin lectura clara de bueno/malo para la divisa
+_NEUTRAL = ("inventor", "rig count", "speaks", "speech", "auction", "holiday",
+            "minutes", "meeting", "testifies", "press conference")
+
+
+def econ_sentiment(evento: str, actual, forecast) -> int | None:
+    """+1 = dato mejor de lo previsto para la divisa, -1 = peor, 0 = en línea,
+    None = sin cifra o sin lectura clara. Misma convención que Forex Factory:
+    más crecimiento, más empleo o más inflación de lo previsto = bueno para la divisa."""
+    if actual is None or forecast is None or pd.isna(actual) or pd.isna(forecast):
+        return None
+    name = str(evento).lower()
+    if any(k in name for k in _NEUTRAL):
+        return None
+    if actual == forecast:
+        return 0
+    better = actual > forecast
+    if any(k in name for k in _INVERSE):
+        better = not better
+    return 1 if better else -1
+
+
+def economic_calendar(max_age_s: int = 300) -> pd.DataFrame:
+    """Calendario económico de la semana con el dato real cuando sale.
+    Se guarda en disco unos minutos para que abrir la sección sea instantáneo."""
+    cached = disk_load("calendario.pkl", None)
+    if cached and time_now() - cached.get("ts", 0) < max_age_s:
+        return cached["df"]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_ff, f_tv = ex.submit(_ff_calendar), ex.submit(_tv_calendar)
+        ff, tv = f_ff.result(), f_tv.result()
+    df = _merge_calendars(ff, tv)
+    if df.empty:
+        return cached["df"] if cached else pd.DataFrame(columns=ECON_COLS)
+    df = df.sort_values("Hora").reset_index(drop=True)
+    disk_save("calendario.pkl", {"ts": time_now(), "df": df})
+    return df
+
+
+def time_now() -> float:
+    return datetime.now(timezone.utc).timestamp()
 
 
 # Divisas afectadas por cada instrumento (para avisar de datos macro)
